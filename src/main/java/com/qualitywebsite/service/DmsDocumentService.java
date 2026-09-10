@@ -1,0 +1,1094 @@
+package com.qualitywebsite.service;
+
+import com.qualitywebsite.dto.DocumentMasterDTO;
+import com.qualitywebsite.dto.UploadResponseDTO;
+import com.qualitywebsite.dto.VersionHistoryDTO;
+import com.qualitywebsite.entity.DeletedDocument;
+import com.qualitywebsite.entity.DmsMigrationLog;
+import com.qualitywebsite.entity.DocumentMaster;
+import com.qualitywebsite.entity.DocumentVersion;
+import com.qualitywebsite.exception.DocumentConflictException;
+import com.qualitywebsite.repository.DeletedDocumentRepository;
+import com.qualitywebsite.repository.DmsMigrationLogRepository;
+import com.qualitywebsite.repository.DocumentMasterRepository;
+import com.qualitywebsite.repository.DocumentVersionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.tika.Tika;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.util.*;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DmsDocumentService {
+
+    private final DocumentMasterRepository documentMasterRepository;
+    private final DocumentVersionRepository documentVersionRepository;
+    private final DmsMigrationLogRepository dmsMigrationLogRepository;
+    private final DeletedDocumentRepository deletedDocumentRepository;
+    private final ActivityLogService activityLogService;
+    private final Tika tika = new Tika();
+
+    private static final Map<String, String> EXTENSION_TO_MIME = Map.of(
+            "PDF", "application/pdf",
+            "DOC", "application/msword",
+            "DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "XLS", "application/vnd.ms-excel",
+            "XLSX", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "PPT", "application/vnd.ms-powerpoint",
+            "PPTX", "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    );
+
+    private static final Set<String> ALLOWED_MIME_TYPES = new HashSet<>(EXTENSION_TO_MIME.values());
+
+    public int[] parseVersion(String versionStr) {
+        if (versionStr == null || versionStr.trim().isEmpty()) {
+            throw new IllegalArgumentException("Document version number is required.");
+        }
+        String trimmed = versionStr.trim();
+        if (!trimmed.matches("^\\d+(\\.\\d+)?$")) {
+            throw new IllegalArgumentException("Please enter a valid document version number, such as 1.0 or 2.1.");
+        }
+        String[] parts = trimmed.split("\\.");
+        int major = Integer.parseInt(parts[0]);
+        int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
+        return new int[]{major, minor};
+    }
+
+    @Transactional
+    public UploadResponseDTO uploadDocument(
+            MultipartFile file,
+            String category,
+            String processGroup,
+            String processId,
+            String processName,
+            String documentName,
+            String remarks,
+            String username,
+            boolean confirmNewVersion) throws IOException {
+        return uploadDocument(file, category, processGroup, processId, processName, documentName, null, remarks, username, confirmNewVersion);
+    }
+
+    @Transactional
+    public UploadResponseDTO uploadDocument(
+            MultipartFile file,
+            String category,
+            String processGroup,
+            String processId,
+            String processName,
+            String documentName,
+            String customVersion,
+            String remarks,
+            String username,
+            boolean confirmNewVersion) throws IOException {
+        return uploadDocument(file, category, processGroup, processId, processName, documentName, customVersion, remarks, remarks, username, confirmNewVersion);
+    }
+
+    @Transactional
+    public UploadResponseDTO uploadDocument(
+            MultipartFile file,
+            String category,
+            String processGroup,
+            String processId,
+            String processName,
+            String documentName,
+            String customVersion,
+            String description,
+            String remarks,
+            String username,
+            boolean confirmNewVersion) throws IOException {
+
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("Please select a document to upload.");
+        }
+
+        boolean catMissing = (category == null || category.trim().isEmpty());
+        boolean procMissing = (processId == null || processId.trim().isEmpty());
+        boolean docMissing = (documentName == null || documentName.trim().isEmpty());
+
+        int missingCount = (catMissing ? 1 : 0) + (procMissing ? 1 : 0) + (docMissing ? 1 : 0);
+        if (missingCount >= 2) {
+            throw new IllegalArgumentException("Please fill in all required fields.");
+        }
+        if (catMissing) {
+            throw new IllegalArgumentException("Please select a category.");
+        }
+        if (procMissing) {
+            throw new IllegalArgumentException("Process ID is required.");
+        }
+        if (docMissing) {
+            throw new IllegalArgumentException("Document name is required.");
+        }
+
+        parseVersion(customVersion);
+
+        String originalName = StringUtils.cleanPath(Objects.requireNonNull(file.getOriginalFilename()));
+        String fileExt = getFileExtension(originalName).toUpperCase(Locale.ROOT);
+        String resolvedMimeType = resolveAndValidateMimeType(file, fileExt);
+
+        String cleanProcId = processId.trim();
+        String cleanCat = category.trim();
+        String cleanDocName = documentName.trim();
+
+        byte[] fileBytes = file.getBytes();
+        String checksum = calculateChecksum(fileBytes);
+        log.info("[DMS Upload Diagnostic] Checksum = {}", checksum);
+
+        // Active-document duplicate file content check (SHA-256 checksum)
+        boolean activeChecksumExists = documentVersionRepository.existsActiveByChecksum(checksum);
+        if (activeChecksumExists) {
+            List<DocumentVersion> activeMatches = documentVersionRepository.findActiveByChecksum(checksum);
+            Optional<DocumentVersion> existingChecksumOpt = activeMatches.stream().findFirst();
+            DocumentMaster existingMaster = existingChecksumOpt.map(DocumentVersion::getDocumentMaster).orElse(null);
+            log.info("[DMS Upload Diagnostic] Active duplicate checksum exists on master: {}",
+                    existingMaster != null ? existingMaster.getId() : "unknown");
+            return UploadResponseDTO.builder()
+                    .success(false)
+                    .message("Duplicate file detected. This document already exists with the same file content.")
+                    .details("This document already exists with the same file content. Please choose a different file or upload a new version.")
+                    .documentMasterId(existingMaster != null ? existingMaster.getId() : null)
+                    .documentCode(existingMaster != null ? existingMaster.getDocumentCode() : null)
+                    .version(existingMaster != null ? existingMaster.getCurrentVersion() : null)
+                    .action("REJECTED")
+                    .isDuplicateChecksum(true)
+                    .existingDocument(existingMaster != null ? toDTO(existingMaster) : null)
+                    .build();
+        }
+
+        // Check if ACTIVE document master already exists by processId + category + documentName (excluding ARCHIVED/DELETED)
+        Optional<DocumentMaster> existingOpt = documentMasterRepository
+                .findActiveByProcessIdAndCategoryAndDocumentName(cleanProcId, cleanCat, cleanDocName);
+
+        if (existingOpt.isPresent()) {
+            DocumentMaster existing = existingOpt.get();
+            // Duplicate file content check on the SAME document master
+            if (documentVersionRepository.existsByDocumentMasterIdAndChecksum(existing.getId(), checksum)) {
+                log.info("[DMS Upload Diagnostic] Same master {} already contains version with checksum {}", existing.getId(), checksum);
+                return UploadResponseDTO.builder()
+                        .success(false)
+                        .message("Duplicate file detected. This document already exists with the same file content.")
+                        .details("This document already exists with the same file content. Please choose a different file or upload a new version.")
+                        .documentMasterId(existing.getId())
+                        .documentCode(existing.getDocumentCode())
+                        .version(existing.getCurrentVersion())
+                        .action("REJECTED")
+                        .isDuplicateChecksum(true)
+                        .existingDocument(toDTO(existing))
+                        .build();
+            }
+
+            if (!confirmNewVersion) {
+                return UploadResponseDTO.builder()
+                        .success(false)
+                        .message("Existing document found. Upload as a new version?")
+                        .documentMasterId(existing.getId())
+                        .documentCode(existing.getDocumentCode())
+                        .version(existing.getCurrentVersion())
+                        .action("DUPLICATE_PROMPT")
+                        .isDuplicateChecksum(false)
+                        .existingDocument(toDTO(existing))
+                        .build();
+            }
+
+            return uploadNewVersion(existing.getId(), fileBytes, originalName, fileExt, resolvedMimeType, customVersion, remarks, username);
+        }
+
+        // New Document Creation
+        int major = 1;
+        int minor = 0;
+        String finalVersionStr = "1.0";
+        if (customVersion != null) {
+            int[] verParts = parseVersion(customVersion);
+            major = verParts[0];
+            minor = verParts[1];
+            finalVersionStr = major + "." + minor;
+        }
+
+        String code = generateDocumentCode(cleanProcId, cleanCat, cleanDocName);
+        String cleanDesc = (description != null && !description.trim().isEmpty()) ? description.trim() : null;
+
+        DocumentMaster master = DocumentMaster.builder()
+                .documentCode(code)
+                .processId(cleanProcId)
+                .processName(processName != null && !processName.trim().isEmpty() ? processName.trim() : cleanProcId)
+                .processGroup(processGroup != null && !processGroup.trim().isEmpty() ? processGroup.trim() : "General")
+                .category(cleanCat)
+                .documentName(cleanDocName)
+                .description(cleanDesc)
+                .currentVersion(finalVersionStr)
+                .status("UNDER_REVIEW")
+                .createdBy(username != null ? username : "admin")
+                .createdDate(LocalDateTime.now())
+                .updatedDate(LocalDateTime.now())
+                .build();
+
+        master = documentMasterRepository.save(master);
+
+        DocumentVersion version = DocumentVersion.builder()
+                .documentMaster(master)
+                .version(finalVersionStr)
+                .majorVersion(major)
+                .minorVersion(minor)
+                .fileName(originalName)
+                .fileType(fileExt)
+                .mimeType(resolvedMimeType)
+                .fileSize((long) fileBytes.length)
+                .fileData(fileBytes)
+                .checksum(checksum)
+                .uploadedBy(username != null ? username : "admin")
+                .uploadedDate(LocalDateTime.now())
+                .approvalStatus("UNDER_REVIEW")
+                .remarks(remarks != null && !remarks.trim().isEmpty() ? remarks.trim() : "Initial document upload - pending review")
+                .isLatest(true)
+                .build();
+
+        version = documentVersionRepository.save(version);
+
+        logActivity(master.getId(), version.getVersion(), "UPLOAD", username, "Uploaded document " + master.getDocumentName() + " (v" + finalVersionStr + ") - Pending Review");
+
+        return UploadResponseDTO.builder()
+                .success(true)
+                .message("Document uploaded successfully and is now UNDER_REVIEW.")
+                .documentMasterId(master.getId())
+                .documentCode(master.getDocumentCode())
+                .version(finalVersionStr)
+                .action("CREATED")
+                .isDuplicateChecksum(false)
+                .existingDocument(toDTO(master))
+                .build();
+    }
+
+    @Transactional
+    public UploadResponseDTO uploadNewVersion(
+            Long masterId,
+            byte[] fileBytes,
+            String originalName,
+            String fileExt,
+            String mimeType,
+            String remarks,
+            String username) {
+        return uploadNewVersion(masterId, fileBytes, originalName, fileExt, mimeType, null, remarks, username);
+    }
+
+    @Transactional
+    public UploadResponseDTO uploadNewVersion(
+            Long masterId,
+            byte[] fileBytes,
+            String originalName,
+            String fileExt,
+            String mimeType,
+            String customVersion,
+            String remarks,
+            String username) {
+
+        try {
+            validateFileContent(fileBytes, originalName, fileExt);
+            DocumentMaster master = documentMasterRepository.findById(masterId)
+                    .orElseThrow(() -> new IllegalArgumentException("Document not found: " + masterId));
+
+            String checksum = calculateChecksum(fileBytes);
+
+            // Check if identical checksum already exists in this document master
+            if (documentVersionRepository.existsByDocumentMasterIdAndChecksum(masterId, checksum)) {
+                return UploadResponseDTO.builder()
+                        .success(false)
+                        .message("Duplicate file detected. This document already has a version with the same file content.")
+                        .details("This document already has a version with the same file content. Please choose a different file or upload a new version.")
+                        .documentMasterId(master.getId())
+                        .documentCode(master.getDocumentCode())
+                        .version(master.getCurrentVersion())
+                        .action("REJECTED")
+                        .isDuplicateChecksum(true)
+                        .existingDocument(toDTO(master))
+                        .build();
+            }
+
+            List<DocumentVersion> allVersions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId);
+            int targetMajor = 1;
+            int targetMinor = 0;
+
+            if (customVersion != null) {
+                int[] verParts = parseVersion(customVersion);
+                targetMajor = verParts[0];
+                targetMinor = verParts[1];
+            } else {
+                int latestMajor = 1;
+                int latestMinor = 0;
+                if (!allVersions.isEmpty()) {
+                    DocumentVersion top = allVersions.get(0);
+                    latestMajor = top.getMajorVersion() != null ? top.getMajorVersion() : 1;
+                    latestMinor = top.getMinorVersion() != null ? top.getMinorVersion() : 0;
+                }
+                targetMajor = latestMajor;
+                targetMinor = latestMinor + 1;
+            }
+
+            String targetVersionStr = targetMajor + "." + targetMinor;
+
+            // DUPLICATE VERSION CHECK: Scoped to this master document
+            Optional<DocumentVersion> dupVerOpt = documentVersionRepository.findByMasterIdAndMajorMinor(masterId, targetMajor, targetMinor);
+            if (dupVerOpt.isPresent()) {
+                throw new IllegalArgumentException("Document version " + targetVersionStr + " already exists. Please enter a different version number.");
+            }
+
+            // Set previous versions isLatest = false
+            for (DocumentVersion v : allVersions) {
+                v.setIsLatest(false);
+            }
+            documentVersionRepository.saveAll(allVersions);
+
+            DocumentVersion newVersion = DocumentVersion.builder()
+                    .documentMaster(master)
+                    .version(targetVersionStr)
+                    .majorVersion(targetMajor)
+                    .minorVersion(targetMinor)
+                    .fileName(originalName)
+                    .fileType(fileExt)
+                    .mimeType(mimeType)
+                    .fileSize((long) fileBytes.length)
+                    .fileData(fileBytes)
+                    .checksum(checksum)
+                    .uploadedBy(username != null ? username : "admin")
+                    .uploadedDate(LocalDateTime.now())
+                    .approvalStatus("UNDER_REVIEW")
+                    .remarks(remarks != null && !remarks.trim().isEmpty() ? remarks.trim() : "Uploaded new version v" + targetVersionStr)
+                    .isLatest(true)
+                    .build();
+
+            newVersion = documentVersionRepository.save(newVersion);
+
+            master.setCurrentVersion(targetVersionStr);
+            master.setStatus("UNDER_REVIEW");
+            master.setUpdatedDate(LocalDateTime.now());
+            master = documentMasterRepository.save(master);
+
+            // Only log on success — failed lock attempts must not create audit records
+            logActivity(master.getId(), targetVersionStr, "UPDATE", username,
+                    "Uploaded new version v" + targetVersionStr + " for " + master.getDocumentName() + " (UNDER_REVIEW)");
+
+            return UploadResponseDTO.builder()
+                    .success(true)
+                    .message("New version v" + targetVersionStr + " uploaded successfully and submitted for review.")
+                    .documentMasterId(master.getId())
+                    .documentCode(master.getDocumentCode())
+                    .version(targetVersionStr)
+                    .action("VERSIONED")
+                    .isDuplicateChecksum(false)
+                    .existingDocument(toDTO(master))
+                    .build();
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document version is being modified by another administrator. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+
+    @Transactional(readOnly = true)
+    public ResponseEntity<byte[]> streamPublicVersion(Long versionId) {
+        return streamPublicVersion(versionId, null);
+    }
+
+    @Transactional(readOnly = true)
+    public ResponseEntity<byte[]> streamPublicVersion(Long versionId, jakarta.servlet.http.HttpServletRequest request) {
+        DocumentVersion version = documentVersionRepository.findById(versionId).orElse(null);
+        if (version == null) {
+            log.warn("[Public DMS Download] Version ID {} not found", versionId);
+            return ResponseEntity.notFound().build();
+        }
+
+        DocumentMaster master = version.getDocumentMaster();
+        if (master == null
+                || !"APPROVED".equalsIgnoreCase(master.getStatus())
+                || !"APPROVED".equalsIgnoreCase(version.getApprovalStatus())) {
+            log.warn("[Public DMS Download] Denied access to unapproved document/version (masterId={}, versionId={})",
+                    master != null ? master.getId() : null, versionId);
+            return ResponseEntity.notFound().build();
+        }
+
+        return buildStreamResponse(version, request);
+    }
+
+    @Transactional(readOnly = true)
+    public ResponseEntity<byte[]> streamPublicLatest(Long masterId) {
+        return streamPublicLatest(masterId, null);
+    }
+
+    @Transactional(readOnly = true)
+    public ResponseEntity<byte[]> streamPublicLatest(Long masterId, jakarta.servlet.http.HttpServletRequest request) {
+        DocumentMaster master = documentMasterRepository.findById(masterId).orElse(null);
+        if (master == null || !"APPROVED".equalsIgnoreCase(master.getStatus())) {
+            log.warn("[Public DMS Download] Master document ID {} not found or not approved", masterId);
+            return ResponseEntity.notFound().build();
+        }
+
+        DocumentVersion latest = documentVersionRepository.findByDocumentMasterIdAndIsLatestTrue(masterId).orElse(null);
+        if (latest == null || !"APPROVED".equalsIgnoreCase(latest.getApprovalStatus())) {
+            List<DocumentVersion> versions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId);
+            latest = versions.stream()
+                    .filter(v -> "APPROVED".equalsIgnoreCase(v.getApprovalStatus()))
+                    .findFirst()
+                    .orElse(null);
+        }
+
+        if (latest == null) {
+            log.warn("[Public DMS Download] No approved version found for master ID {}", masterId);
+            return ResponseEntity.notFound().build();
+        }
+
+        return buildStreamResponse(latest, request);
+    }
+
+    private ResponseEntity<byte[]> buildStreamResponse(DocumentVersion version) {
+        return buildStreamResponse(version, null);
+    }
+
+    private ResponseEntity<byte[]> buildStreamResponse(DocumentVersion version, jakarta.servlet.http.HttpServletRequest request) {
+        byte[] data = version.getFileData();
+        if (data == null || data.length == 0) {
+            return ResponseEntity.notFound().build();
+        }
+
+        // Task 3: Use stored MIME type for streaming
+        String mimeType = version.getMimeType();
+        if (mimeType == null || mimeType.trim().isEmpty()) {
+            mimeType = EXTENSION_TO_MIME.getOrDefault(version.getFileType().toUpperCase(Locale.ROOT), "application/octet-stream");
+        }
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.parseMediaType(mimeType));
+        headers.setContentLength(data.length);
+
+        org.springframework.http.ContentDisposition contentDisposition;
+        if ("application/pdf".equalsIgnoreCase(mimeType) || "PDF".equalsIgnoreCase(version.getFileType())) {
+            contentDisposition = org.springframework.http.ContentDisposition.builder("inline")
+                    .filename(version.getFileName())
+                    .build();
+        } else {
+            contentDisposition = org.springframework.http.ContentDisposition.builder("attachment")
+                    .filename(version.getFileName())
+                    .build();
+        }
+        headers.setContentDisposition(contentDisposition);
+
+        if (request != null && "HEAD".equalsIgnoreCase(request.getMethod())) {
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .build();
+        }
+
+        return ResponseEntity.ok()
+                .headers(headers)
+                .body(data);
+    }
+
+    @Transactional(readOnly = true)
+    public List<DocumentMasterDTO> getAllAdminDocuments(String query, String category) {
+        return getAllAdminDocuments(query, category, "ACTIVE");
+    }    @Transactional(readOnly = true)
+    public List<DocumentMasterDTO> getAllAdminDocuments(String query, String category, String status) {
+        String cleanStatus = (status != null && !status.trim().isEmpty()) ? status.trim() : "ACTIVE";
+        if ("DELETED".equalsIgnoreCase(cleanStatus)) {
+            List<DocumentMasterDTO> masterDeleted = documentMasterRepository.searchAndFilter(query, category, "DELETED").stream()
+                    .map(this::toDTO)
+                    .toList();
+            List<DocumentMasterDTO> extraDeleted = deletedDocumentRepository.findAllByOrderByDeletedDateDesc().stream()
+                    .filter(d -> matchesQueryAndCategory(d, query, category))
+                    .map(this::toDTOFromDeletedDoc)
+                    .toList();
+
+            List<DocumentMasterDTO> combined = new ArrayList<>(masterDeleted);
+            for (DocumentMasterDTO dto : extraDeleted) {
+                boolean alreadyInList = combined.stream().anyMatch(existing ->
+                        Objects.equals(existing.getId(), dto.getId()) ||
+                        (dto.getDocumentCode() != null && !dto.getDocumentCode().isBlank() && dto.getDocumentCode().equalsIgnoreCase(existing.getDocumentCode())) ||
+                        (Objects.equals(existing.getProcessId(), dto.getProcessId()) &&
+                         Objects.equals(existing.getCategory(), dto.getCategory()) &&
+                         Objects.equals(existing.getDocumentName(), dto.getDocumentName())));
+                if (!alreadyInList) {
+                    combined.add(dto);
+                }
+            }
+            return combined;
+        }
+        return documentMasterRepository.searchAndFilter(query, category, cleanStatus).stream()
+                .map(this::toDTO)
+                .toList();
+    }
+
+    private boolean matchesQueryAndCategory(DeletedDocument d, String query, String category) {
+        if (category != null && !category.trim().isEmpty() && !category.equalsIgnoreCase(d.getCategory())) {
+            return false;
+        }
+        if (query == null || query.trim().isEmpty()) {
+            return true;
+        }
+        String q = query.trim().toLowerCase(Locale.ROOT);
+        return (d.getDocumentName() != null && d.getDocumentName().toLowerCase(Locale.ROOT).contains(q)) ||
+               (d.getProcessId() != null && d.getProcessId().toLowerCase(Locale.ROOT).contains(q)) ||
+               (d.getCategory() != null && d.getCategory().toLowerCase(Locale.ROOT).contains(q)) ||
+               (d.getProcessGroup() != null && d.getProcessGroup().toLowerCase(Locale.ROOT).contains(q));
+    }
+
+    private DocumentMasterDTO toDTOFromDeletedDoc(DeletedDocument d) {
+        return DocumentMasterDTO.builder()
+                .id(d.getOriginalMasterId() != null ? d.getOriginalMasterId() : d.getId())
+                .documentCode(d.getDocumentCode())
+                .processId(d.getProcessId())
+                .processName(d.getProcessName())
+                .processGroup(d.getProcessGroup())
+                .category(d.getCategory())
+                .documentName(d.getDocumentName())
+                .description(d.getDescription())
+                .currentVersion(d.getCurrentVersion())
+                .status("DELETED")
+                .createdBy(d.getCreatedBy())
+                .createdDate(d.getCreatedDate())
+                .updatedDate(d.getDeletedDate())
+                .deletedBy(d.getDeletedBy())
+                .deletedDate(d.getDeletedDate())
+                .build();
+    }
+
+    // Task 4: Public website retrieves ONLY documents where status = APPROVED and latest version approvalStatus = APPROVED
+    @Transactional(readOnly = true)
+    public List<DocumentMasterDTO> getPublicApprovedDocuments(String category) {
+        List<DocumentMaster> masters;
+        if (category != null && !category.trim().isEmpty()) {
+            masters = documentMasterRepository.findByCategoryIgnoreCaseAndStatus(category, "APPROVED");
+        } else {
+            masters = documentMasterRepository.findByStatus("APPROVED");
+        }
+
+        return masters.stream()
+                .map(this::toDTO)
+                .filter(dto -> dto.getLatestVersionId() != null && "APPROVED".equalsIgnoreCase(dto.getStatus()))
+                .toList();
+    }
+
+
+
+    @Transactional(readOnly = true)
+    public Optional<DocumentMasterDTO> getDocumentMasterById(Long id) {
+        return documentMasterRepository.findById(id).map(this::toDTO);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<DocumentMasterDTO> getDocumentById(Long id) {
+        return documentMasterRepository.findById(id).map(this::toDTO);
+    }
+
+    @Transactional(readOnly = true)
+    public List<VersionHistoryDTO> getVersionHistory(Long masterId) {
+        return documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId).stream()
+                .map(this::toVersionDTO)
+                .toList();
+    }
+
+    // =========================================================
+    // Approval Workflow — all methods guarded by Optimistic Locking
+    // =========================================================
+
+    @Transactional
+    public boolean approveDocument(Long masterId, String username) {
+        try {
+            Optional<DocumentMaster> opt = documentMasterRepository.findById(masterId);
+            if (opt.isEmpty()) return false;
+
+            DocumentMaster master = opt.get();
+            master.setStatus("APPROVED");
+            master.setUpdatedDate(LocalDateTime.now());
+            documentMasterRepository.save(master);
+
+            Optional<DocumentVersion> latestOpt = documentVersionRepository.findByDocumentMasterIdAndIsLatestTrue(masterId);
+            if (latestOpt.isPresent()) {
+                DocumentVersion latest = latestOpt.get();
+                latest.setApprovalStatus("APPROVED");
+                latest.setApprovedBy(username != null ? username : "admin");
+                latest.setApprovedDate(LocalDateTime.now());
+                documentVersionRepository.save(latest);
+            }
+
+            // Only log on success
+            logActivity(masterId, master.getCurrentVersion(), "APPROVE", username,
+                    "Approved document: " + master.getDocumentName());
+            return true;
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document was modified by another administrator while approving. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+    @Transactional
+    public boolean rejectDocument(Long masterId, String remarks, String username) {
+        try {
+            Optional<DocumentMaster> opt = documentMasterRepository.findById(masterId);
+            if (opt.isEmpty()) return false;
+
+            DocumentMaster master = opt.get();
+            master.setStatus("REJECTED");
+            master.setUpdatedDate(LocalDateTime.now());
+            documentMasterRepository.save(master);
+
+            Optional<DocumentVersion> latestOpt = documentVersionRepository.findByDocumentMasterIdAndIsLatestTrue(masterId);
+            if (latestOpt.isPresent()) {
+                DocumentVersion latest = latestOpt.get();
+                latest.setApprovalStatus("REJECTED");
+                latest.setRemarks(remarks);
+                documentVersionRepository.save(latest);
+            }
+
+            logActivity(masterId, master.getCurrentVersion(), "REJECT", username,
+                    "Rejected document: " + master.getDocumentName() + " (Remarks: " + remarks + ")");
+            return true;
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document was modified by another administrator while rejecting. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+    @Transactional
+    public boolean archiveDocument(Long masterId, String username) {
+        try {
+            Optional<DocumentMaster> opt = documentMasterRepository.findById(masterId);
+            if (opt.isEmpty()) return false;
+
+            DocumentMaster master = opt.get();
+            master.setStatus("ARCHIVED");
+            master.setUpdatedDate(LocalDateTime.now());
+            documentMasterRepository.save(master);
+
+            List<DocumentVersion> allVersions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId);
+            for (DocumentVersion v : allVersions) {
+                v.setApprovalStatus("ARCHIVED");
+            }
+            if (!allVersions.isEmpty()) {
+                documentVersionRepository.saveAll(allVersions);
+            }
+
+            saveToDeletedDocumentsStorage(master, username);
+
+            // Only log on success
+            logActivity(masterId, master.getCurrentVersion(), "ARCHIVE", username,
+                    "Archived/deleted document: " + master.getDocumentName());
+            return true;
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document was modified by another administrator while archiving. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+    @Transactional
+    public boolean restoreDocument(Long masterId, String username) {
+        try {
+            Optional<DocumentMaster> opt = documentMasterRepository.findById(masterId);
+            if (opt.isEmpty()) return false;
+
+            DocumentMaster master = opt.get();
+            master.setStatus("APPROVED");
+            master.setUpdatedDate(LocalDateTime.now());
+            documentMasterRepository.save(master);
+
+            List<DocumentVersion> allVersions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId);
+            for (DocumentVersion v : allVersions) {
+                v.setApprovalStatus("APPROVED");
+            }
+            if (!allVersions.isEmpty()) {
+                documentVersionRepository.saveAll(allVersions);
+            }
+
+            deletedDocumentRepository.findByOriginalMasterId(masterId).ifPresent(deletedDocumentRepository::delete);
+
+            logActivity(masterId, master.getCurrentVersion(), "RESTORE", username,
+                    "Restored document: " + master.getDocumentName() + " (Restored to APPROVED status)");
+            return true;
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document was modified by another administrator while restoring. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+    @Transactional
+    public boolean deletePermanently(Long masterId, String username) {
+        try {
+            Optional<DocumentMaster> opt = documentMasterRepository.findById(masterId);
+            if (opt.isEmpty()) return false;
+
+            DocumentMaster master = opt.get();
+            master.setStatus("DELETED");
+            master.setDeletedBy(username != null ? username : "admin");
+            master.setDeletedDate(LocalDateTime.now());
+            master.setUpdatedDate(LocalDateTime.now());
+            documentMasterRepository.save(master);
+
+            List<DocumentVersion> allVersions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(masterId);
+            for (DocumentVersion v : allVersions) {
+                v.setApprovalStatus("DELETED");
+            }
+            if (!allVersions.isEmpty()) {
+                documentVersionRepository.saveAll(allVersions);
+            }
+
+            saveToDeletedDocumentsStorage(master, username);
+
+            logActivity(masterId, master.getCurrentVersion(), "PERMANENT_DELETE", username,
+                    "Permanently deleted document: " + master.getDocumentName() + " (Archived in Deleted Documents table)");
+            return true;
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document was modified by another administrator while deleting permanently. " +
+                    "Please refresh and try again.", masterId);
+        }
+    }
+
+    @Transactional
+    public DocumentMasterDTO updateMetadata(Long masterId, DocumentMasterDTO updateData, String username) {
+        try {
+            DocumentMaster master = documentMasterRepository.findById(masterId)
+                    .orElseThrow(() -> new IllegalArgumentException("Document not found: " + masterId));
+
+            // Apply the client's lock token to the managed entity.
+            // Hibernate then uses this value in: UPDATE ... WHERE entity_version = ?
+            // If another admin saved first (incrementing the version), JPA detects the
+            // mismatch at flush time and throws ObjectOptimisticLockingFailureException.
+            if (updateData.getEntityVersion() != null) {
+                master.setEntityVersion(updateData.getEntityVersion());
+            }
+
+            if (updateData.getDocumentName() != null && !updateData.getDocumentName().trim().isEmpty()) {
+                master.setDocumentName(updateData.getDocumentName().trim());
+            }
+            if (updateData.getCategory() != null && !updateData.getCategory().trim().isEmpty()) {
+                master.setCategory(updateData.getCategory().trim());
+            }
+            if (updateData.getProcessId() != null && !updateData.getProcessId().trim().isEmpty()) {
+                master.setProcessId(updateData.getProcessId().trim());
+            }
+            if (updateData.getProcessGroup() != null && !updateData.getProcessGroup().trim().isEmpty()) {
+                master.setProcessGroup(updateData.getProcessGroup().trim());
+            }
+            if (updateData.getDescription() != null) {
+                if (updateData.getDescription().trim().isEmpty()) {
+                    master.setDescription(null); // Explicit clear
+                } else {
+                    master.setDescription(updateData.getDescription().trim()); // Explicit set
+                }
+            }
+
+            master.setUpdatedDate(LocalDateTime.now());
+            master = documentMasterRepository.save(master);
+
+            // Only log on success — failed lock attempts must not create audit records
+            logActivity(masterId, master.getCurrentVersion(), "UPDATE", username,
+                    "Updated metadata for " + master.getDocumentName());
+
+            return toDTO(master);
+
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new DocumentConflictException(
+                    "This document has been modified by another administrator. " +
+                    "Please refresh the page and try again.", masterId);
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public Map<String, Object> getDashboardStats() {
+        Map<String, Object> stats = new HashMap<>();
+        long totalApproved = documentMasterRepository.countByStatus("APPROVED");
+        long pendingReview = documentMasterRepository.countByStatus("UNDER_REVIEW");
+        long aspicePrm = documentMasterRepository.countByCategoryIgnoreCaseAndStatus("ASPICE PRM", "APPROVED");
+        long generic = documentMasterRepository.countByCategoryIgnoreCaseAndStatus("Generic Templates", "APPROVED");
+        long lessons = documentMasterRepository.countByCategoryIgnoreCaseAndStatus("Lessons Learned", "APPROVED");
+        long checklist = documentMasterRepository.countByCategoryIgnoreCaseAndStatus("Assessment Checklist", "APPROVED");
+        LocalDateTime latest = documentMasterRepository.findLatestUploadDate();
+
+        stats.put("totalDocuments", totalApproved);
+        stats.put("pendingReview", pendingReview);
+        stats.put("aspicePrmDocuments", aspicePrm);
+        stats.put("genericTemplates", generic);
+        stats.put("lessonsLearned", lessons);
+        stats.put("assessmentChecklists", checklist);
+        stats.put("latestUploadDate", latest != null ? latest.toString() : "N/A");
+        return stats;
+    }
+
+    public DocumentMasterDTO toDTO(DocumentMaster master) {
+        Optional<DocumentVersion> latestOpt = documentVersionRepository.findByDocumentMasterIdAndIsLatestTrue(master.getId());
+        if (latestOpt.isEmpty()) {
+            List<DocumentVersion> versions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(master.getId());
+            if (!versions.isEmpty()) {
+                latestOpt = Optional.of(versions.get(0));
+            }
+        }
+
+        DocumentMasterDTO.DocumentMasterDTOBuilder builder = DocumentMasterDTO.builder()
+                .id(master.getId())
+                .entityVersion(master.getEntityVersion())   // Optimistic lock token
+                .documentCode(master.getDocumentCode())
+                .processId(master.getProcessId())
+                .processName(master.getProcessName())
+                .processGroup(master.getProcessGroup())
+                .category(master.getCategory())
+                .documentName(master.getDocumentName())
+                .description(master.getDescription())
+                .currentVersion(master.getCurrentVersion())
+                .status(master.getStatus())
+                .createdBy(master.getCreatedBy())
+                .createdDate(master.getCreatedDate())
+                .updatedDate(master.getUpdatedDate())
+                .deletedBy(master.getDeletedBy())
+                .deletedDate(master.getDeletedDate());
+
+        if (latestOpt.isPresent()) {
+            DocumentVersion latest = latestOpt.get();
+            builder.latestVersionId(latest.getId())
+                    .fileName(latest.getFileName())
+                    .fileType(latest.getFileType())
+                    .mimeType(latest.getMimeType())
+                    .fileSize(latest.getFileSize())
+                    .checksum(latest.getChecksum())
+                    .downloadUrl("/api/public/dms/download/" + latest.getId());
+        }
+
+        return builder.build();
+    }
+
+    public VersionHistoryDTO toVersionDTO(DocumentVersion v) {
+        return VersionHistoryDTO.builder()
+                .versionId(v.getId())
+                .documentMasterId(v.getDocumentMaster().getId())
+                .version(v.getVersion()) // Generated dynamically from major.minor
+                .majorVersion(v.getMajorVersion())
+                .minorVersion(v.getMinorVersion())
+                .fileName(v.getFileName())
+                .fileType(v.getFileType())
+                .mimeType(v.getMimeType())
+                .fileSize(v.getFileSize())
+                .checksum(v.getChecksum())
+                .uploadedBy(v.getUploadedBy())
+                .uploadedDate(v.getUploadedDate())
+                .approvedBy(v.getApprovedBy())
+                .approvedDate(v.getApprovedDate())
+                .approvalStatus(v.getApprovalStatus())
+                .remarks(v.getRemarks())
+                .isLatest(v.getIsLatest())
+                .downloadUrl("/api/public/dms/download/" + v.getId())
+                .build();
+    }
+
+    public void logActivity(Long masterId, String version, String action, String username, String remarks) {
+        String user = username != null ? username : "admin";
+        DmsMigrationLog log = DmsMigrationLog.builder()
+                .documentMasterId(masterId)
+                .version(version)
+                .action(action)
+                .performedBy(user)
+                .performedDate(LocalDateTime.now())
+                .remarks(remarks)
+                .build();
+        dmsMigrationLogRepository.save(log);
+
+        activityLogService.logActivity(user, "DMS " + action, remarks != null ? remarks : ("Document Master ID: " + masterId + " (v" + version + ")"));
+    }
+
+    public String calculateChecksum(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(bytes);
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-256 algorithm not found", e);
+        }
+    }
+
+    // Task 3: MIME Type & Content Validation via Apache Tika Magic Bytes
+    private String resolveAndValidateMimeType(MultipartFile file, String fileExt) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("Please select a document to upload.");
+        }
+        String expectedMime = EXTENSION_TO_MIME.get(fileExt);
+
+        if (expectedMime == null) {
+            log.warn("[DMS Validation] Rejected upload with unsupported extension: .{}", fileExt);
+            throw new IllegalArgumentException("Invalid file format. Please upload a supported document type.");
+        }
+
+        String detectedMime;
+        try {
+            detectedMime = tika.detect(file.getInputStream(), file.getOriginalFilename());
+        } catch (Exception e) {
+            log.warn("[DMS Validation] Tika detection failed for file {}, falling back to client header: {}", file.getOriginalFilename(), e.getMessage());
+            detectedMime = file.getContentType();
+        }
+
+        if (detectedMime != null && !detectedMime.equalsIgnoreCase("application/octet-stream")) {
+            boolean valid = detectedMime.equalsIgnoreCase(expectedMime)
+                    || ALLOWED_MIME_TYPES.contains(detectedMime)
+                    || (detectedMime.contains("zip") && (fileExt.equals("DOCX") || fileExt.equals("XLSX") || fileExt.equals("PPTX")))
+                    || (detectedMime.contains("ole-storage") && (fileExt.equals("DOC") || fileExt.equals("XLS") || fileExt.equals("PPT")));
+            if (!valid) {
+                log.warn("[DMS Validation] Content mismatch for file {}: detected MIME {} vs expected extension .{}", file.getOriginalFilename(), detectedMime, fileExt);
+                throw new IllegalArgumentException("Invalid file format. Please upload a supported document type.");
+            }
+            return detectedMime;
+        }
+
+        return expectedMime;
+    }
+
+    public void validateFileContent(byte[] bytes, String originalName, String fileExt) {
+        if (bytes == null || bytes.length == 0) {
+            throw new IllegalArgumentException("Please select a document to upload.");
+        }
+
+        String ext = (fileExt != null) ? fileExt.toUpperCase(Locale.ROOT) : getFileExtension(originalName).toUpperCase(Locale.ROOT);
+        String expectedMime = EXTENSION_TO_MIME.get(ext);
+        if (expectedMime == null) {
+            log.warn("[DMS Validation] Rejected version file with unsupported extension: .{}", ext);
+            throw new IllegalArgumentException("Invalid file format. Please upload a supported document type.");
+        }
+
+        String detectedMime;
+        try {
+            detectedMime = tika.detect(bytes, originalName);
+        } catch (Exception e) {
+            detectedMime = expectedMime;
+        }
+
+        if (detectedMime != null && !detectedMime.equalsIgnoreCase("application/octet-stream")) {
+            boolean valid = detectedMime.equalsIgnoreCase(expectedMime)
+                    || ALLOWED_MIME_TYPES.contains(detectedMime)
+                    || (detectedMime.contains("zip") && (ext.equals("DOCX") || ext.equals("XLSX") || ext.equals("PPTX")))
+                    || (detectedMime.contains("ole-storage") && (ext.equals("DOC") || ext.equals("XLS") || ext.equals("PPT")));
+            if (!valid) {
+                log.warn("[DMS Validation] Content mismatch for version file {}: detected MIME {} vs expected extension .{}", originalName, detectedMime, ext);
+                throw new IllegalArgumentException("Invalid file format. Please upload a supported document type.");
+            }
+        }
+    }
+
+    private String getFileExtension(String fileName) {
+        int idx = fileName.lastIndexOf('.');
+        return idx >= 0 ? fileName.substring(idx + 1) : "DOC";
+    }
+
+    private String removeExtension(String fileName) {
+        int idx = fileName.lastIndexOf('.');
+        return idx >= 0 ? fileName.substring(0, idx) : fileName;
+    }
+
+    /**
+     * Generates a unique document code from processId, category, and documentName.
+     * Format: <PROC>-<CAT_ABBREV>-<DOC_ABBREV>-<TIMESTAMP>
+     */
+    private String generateDocumentCode(String processId, String category, String documentName) {
+        String proc = processId.replaceAll("[^A-Za-z0-9]", "").toUpperCase(Locale.ROOT);
+        if (proc.length() > 8) proc = proc.substring(0, 8);
+
+        String cat = category.replaceAll("[^A-Za-z0-9]", "").toUpperCase(Locale.ROOT);
+        if (cat.length() > 4) cat = cat.substring(0, 4);
+
+        String doc = documentName.replaceAll("[^A-Za-z0-9]", "").toUpperCase(Locale.ROOT);
+        if (doc.length() > 6) doc = doc.substring(0, 6);
+
+        String timestamp = String.valueOf(System.currentTimeMillis()).substring(8);
+        String candidate = proc + "-" + cat + "-" + doc + "-" + timestamp;
+
+        // Ensure uniqueness
+        if (documentMasterRepository.findByDocumentCode(candidate).isPresent()) {
+            candidate = candidate + "-" + (int)(Math.random() * 1000);
+        }
+        return candidate;
+    }
+
+    public List<DocumentMasterDTO> searchAndFilter(String query, String category) {
+        return searchAndFilter(query, category, "ACTIVE");
+    }
+
+    public List<DocumentMasterDTO> searchAndFilter(String query, String category, String status) {
+        return getAllAdminDocuments(query, category, status);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<DocumentMasterDTO> searchAndFilterPaged(String query, String category, Pageable pageable) {
+        return searchAndFilterPaged(query, category, "ACTIVE", pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<DocumentMasterDTO> searchAndFilterPaged(String query, String category, String status, Pageable pageable) {
+        String cleanQ = (query != null && !query.trim().isEmpty()) ? query.trim() : null;
+        String cleanCat = (category != null && !category.trim().isEmpty()) ? category.trim() : null;
+        String cleanStatus = (status != null && !status.trim().isEmpty()) ? status.trim() : "ACTIVE";
+        Page<DocumentMaster> pagedMasters = documentMasterRepository.searchAndFilterPaged(cleanQ, cleanCat, cleanStatus, pageable);
+        return pagedMasters.map(this::toDTO);
+    }
+
+    private void saveToDeletedDocumentsStorage(DocumentMaster master, String username) {
+        if (master == null) return;
+        
+        Optional<DocumentVersion> latestOpt = documentVersionRepository.findByDocumentMasterIdAndIsLatestTrue(master.getId());
+        if (latestOpt.isEmpty()) {
+            List<DocumentVersion> versions = documentVersionRepository.findByDocumentMasterIdOrderByUploadedDateDesc(master.getId());
+            if (!versions.isEmpty()) {
+                latestOpt = Optional.of(versions.get(0));
+            }
+        }
+        DocumentVersion latest = latestOpt.orElse(null);
+
+        DeletedDocument delDoc = deletedDocumentRepository.findByOriginalMasterId(master.getId())
+                .orElseGet(() -> DeletedDocument.builder().originalMasterId(master.getId()).build());
+
+        delDoc.setDocumentCode(master.getDocumentCode());
+        delDoc.setProcessId(master.getProcessId());
+        delDoc.setProcessName(master.getProcessName());
+        delDoc.setProcessGroup(master.getProcessGroup());
+        delDoc.setCategory(master.getCategory() != null && !master.getCategory().isBlank() ? master.getCategory() : "General");
+        delDoc.setDocumentName(master.getDocumentName() != null && !master.getDocumentName().isBlank() ? master.getDocumentName() : "Untitled Document");
+        delDoc.setDescription(master.getDescription());
+        delDoc.setCurrentVersion(master.getCurrentVersion());
+        delDoc.setFileName(latest != null ? latest.getFileName() : null);
+        delDoc.setFileType(latest != null ? latest.getFileType() : null);
+        delDoc.setMimeType(latest != null ? latest.getMimeType() : null);
+        delDoc.setFileSize(latest != null ? latest.getFileSize() : null);
+        delDoc.setFileData(latest != null ? latest.getFileData() : null);
+        delDoc.setChecksum(latest != null ? latest.getChecksum() : null);
+        delDoc.setCreatedBy(master.getCreatedBy());
+        delDoc.setCreatedDate(master.getCreatedDate());
+        delDoc.setDeletedBy(username != null && !username.isBlank() ? username : "admin");
+        delDoc.setDeletedDate(master.getDeletedDate() != null ? master.getDeletedDate() : LocalDateTime.now());
+
+        deletedDocumentRepository.save(delDoc);
+    }
+}
